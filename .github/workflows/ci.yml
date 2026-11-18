@@ -1,0 +1,40 @@
+name: CI — Aconchego Finanças
+
+on:
+  push:
+    branches: [main, feat/finalizacao-cloud-e2e]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quality:
+    name: TypeScript, Testes e Build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Instalar dependências
+        run: npm ci --no-audit --no-fund
+
+      - name: Verificar tipagem TypeScript
+        run: npm run lint
+
+      - name: Executar suíte de testes automatizados
+        run: npm test
+
+      - name: Build de produção (Vite)
+        run: npm run build
+
+      - name: Instalar Chromium para E2E
+        run: npx playwright install --with-deps chromium
+
+      - name: Executar E2E sem credenciais externas
+        run: npm run test:e2e

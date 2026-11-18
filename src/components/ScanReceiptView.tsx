@@ -14,24 +14,63 @@ import {
   Droplets,
   Receipt,
   X,
+  ShieldAlert,
 } from 'lucide-react';
-import { ScannedReceiptResult, Transaction } from '../types/finance';
+import {
+  PaymentMethod,
+  ScannedReceiptResult,
+  Transaction,
+  TransactionStatus,
+  UncertainReceiptField,
+} from '../types/finance';
+import { DEFAULT_CATEGORIES, PAYMENT_METHODS } from '../data/initialData';
 import { formatCurrency, formatFriendlyDate } from '../utils/formatters';
+import { RECEIPT_SAMPLE_URL, resolveAssetUrl } from '../utils/assets';
+import { parseCurrencyInput } from '../utils/financeMath';
+import { computeFileSha256Hex } from '../services/financeRepository';
 import { CategoryIcon } from './CategoryIcon';
 
+export interface ConfirmScannedExpenseInput {
+  description: string;
+  amount: number;
+  category: string;
+  date: string;
+  account: PaymentMethod;
+  status: TransactionStatus;
+  notes?: string;
+  imageUrl: string;
+  fileHash?: string;
+  documentType: string;
+  extractedPayload?: Record<string, unknown>;
+}
+
 interface ScanReceiptViewProps {
-  onAutoRegisterExpense: (
-    data: Omit<Transaction, 'id' | 'createdAt'>
-  ) => Transaction;
+  authHeaders: Record<string, string>;
+  demoImportedHashes?: string[];
+  onConfirmExpense: (data: ConfirmScannedExpenseInput) => Promise<Transaction>;
   onEditTransaction: (tx: Transaction) => void;
-  onDeleteTransaction: (id: string) => void;
+  onDeleteTransaction: (id: string) => void | Promise<void>;
   onGoToTransactions: () => void;
   onViewReceipt: (tx: Transaction) => void;
 }
 
 interface CompressedImage {
   dataUrl: string;
-  mimeType: string;
+  mimeType: 'image/jpeg' | 'image/png' | 'image/webp';
+}
+
+interface ReviewDraft {
+  documentType: string;
+  confidence: 'alta' | 'media' | 'baixa';
+  uncertainFields: UncertainReceiptField[];
+  fileHash?: string;
+  description: string;
+  amountStr: string;
+  date: string;
+  category: string;
+  account: PaymentMethod;
+  status: TransactionStatus;
+  notes: string;
 }
 
 async function compressBlobToJpeg(blob: Blob): Promise<CompressedImage> {
@@ -63,7 +102,7 @@ async function compressBlobToJpeg(blob: Blob): Promise<CompressedImage> {
         ctx.fillStyle = '#FFFFFF';
         ctx.fillRect(0, 0, width, height);
         ctx.drawImage(img, 0, 0, width, height);
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.82);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.84);
         URL.revokeObjectURL(objectUrl);
         resolve({ dataUrl, mimeType: 'image/jpeg' });
       } catch (err) {
@@ -80,7 +119,9 @@ async function compressBlobToJpeg(blob: Blob): Promise<CompressedImage> {
 }
 
 export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
-  onAutoRegisterExpense,
+  authHeaders,
+  demoImportedHashes,
+  onConfirmExpense,
   onEditTransaction,
   onDeleteTransaction,
   onGoToTransactions,
@@ -92,7 +133,10 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
 
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [isScanning, setIsScanning] = useState(false);
+  const [isConfirming, setIsConfirming] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
+  const [reviewError, setReviewError] = useState<string | null>(null);
+  const [pendingReview, setPendingReview] = useState<ReviewDraft | null>(null);
   const [lastRegistered, setLastRegistered] = useState<{
     transaction: Transaction;
     documentType: string;
@@ -129,7 +173,7 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setCameraError(
-        'Câmera ao vivo não disponível neste navegador. Use o botão "Tirar Foto / Enviar Arquivo" abaixo.'
+        'Câmera ao vivo não disponível neste navegador. Use o botão "Escolher Imagem" abaixo.'
       );
       return;
     }
@@ -151,20 +195,17 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
       streamRef.current = stream;
       setIsCameraOpen(true);
 
-      // Attach stream after video element renders
       setTimeout(() => {
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
-          videoRef.current.play().catch(() => {
-            // Auto-play handled by attributes
-          });
+          videoRef.current.play().catch(() => {});
         }
       }, 50);
     } catch (err) {
       console.error('Erro ao acessar câmera:', err);
       setIsCameraOpen(false);
       setCameraError(
-        'Não foi possível abrir a câmera ao vivo (permissão negada ou dispositivo sem câmera). Você pode usar o botão "Enviar Foto / Câmera Nativa" abaixo.'
+        'Não foi possível abrir a câmera ao vivo (permissão negada ou dispositivo sem câmera). Use "Escolher Imagem".'
       );
     }
   };
@@ -175,21 +216,37 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
     startCamera(next);
   };
 
-  const processAndRegisterImage = async (dataUrl: string, mimeType: string) => {
+  const analyzeImageForReview = async (
+    dataUrl: string,
+    mimeType: 'image/jpeg' | 'image/png' | 'image/webp'
+  ) => {
     setPreviewUrl(dataUrl);
     setIsScanning(true);
     setScanError(null);
+    setReviewError(null);
+    setPendingReview(null);
     setLastRegistered(null);
 
     try {
+      const localHash = await computeFileSha256Hex(dataUrl);
+      if (demoImportedHashes && demoImportedHashes.includes(localHash)) {
+        throw new Error(
+          'Este comprovante já foi importado anteriormente. Para evitar lançamentos duplicados, o envio foi bloqueado.'
+        );
+      }
+
       const today = new Date().toISOString().split('T')[0];
       const response = await fetch('/api/receipts/scan', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders,
+        },
         body: JSON.stringify({
           imageBase64: dataUrl,
           mimeType,
           todayDate: today,
+          ...(demoImportedHashes ? { demoState: { importedHashes: demoImportedHashes } } : {}),
         }),
       });
 
@@ -203,26 +260,20 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
 
       const parsed = payload as ScannedReceiptResult;
 
-      const createdTx = onAutoRegisterExpense({
-        description: parsed.description,
-        amount: parsed.amount,
-        type: 'expense',
-        category: parsed.category,
-        date: parsed.date,
-        account: parsed.account,
-        status: parsed.status,
-        imageUrl: dataUrl,
-        notes: parsed.notes
-          ? `${parsed.documentType} · ${parsed.notes}`
-          : parsed.documentType,
-      });
-
-      setLastRegistered({
-        transaction: createdTx,
+      // Nunca salva automaticamente: cria prévia editável para revisão humana
+      setPendingReview({
         documentType: parsed.documentType,
         confidence: parsed.confidence,
+        uncertainFields: parsed.uncertainFields || [],
+        fileHash: parsed.fileHash || localHash,
+        description: parsed.description,
+        amountStr: parsed.amount.toFixed(2).replace('.', ','),
+        date: parsed.date,
+        category: parsed.category,
+        account: parsed.account,
+        status: parsed.status,
+        notes: parsed.notes || '',
       });
-      setSessionScanned((prev) => [createdTx, ...prev]);
     } catch (err: unknown) {
       const message =
         err instanceof Error
@@ -231,6 +282,65 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
       setScanError(message);
     } finally {
       setIsScanning(false);
+    }
+  };
+
+  const handleConfirmReview = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!pendingReview || !previewUrl || isConfirming) return;
+    setReviewError(null);
+
+    const parsedAmount = parseCurrencyInput(pendingReview.amountStr);
+    if (parsedAmount === null) {
+      setReviewError('Informe um valor válido maior que zero antes de confirmar.');
+      return;
+    }
+
+    if (!pendingReview.description.trim()) {
+      setReviewError('Informe a descrição do estabelecimento ou conta.');
+      return;
+    }
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(pendingReview.date)) {
+      setReviewError('Informe uma data válida no formato AAAA-MM-DD.');
+      return;
+    }
+
+    setIsConfirming(true);
+    try {
+      const createdTx = await onConfirmExpense({
+        description: pendingReview.description.trim(),
+        amount: parsedAmount,
+        category: pendingReview.category,
+        date: pendingReview.date,
+        account: pendingReview.account,
+        status: pendingReview.status,
+        imageUrl: previewUrl,
+        fileHash: pendingReview.fileHash,
+        documentType: pendingReview.documentType,
+        notes: pendingReview.notes.trim()
+          ? `${pendingReview.documentType} · ${pendingReview.notes.trim()}`
+          : pendingReview.documentType,
+        extractedPayload: {
+          documentType: pendingReview.documentType,
+          confidence: pendingReview.confidence,
+          uncertainFields: pendingReview.uncertainFields,
+        },
+      });
+
+      setLastRegistered({
+        transaction: createdTx,
+        documentType: pendingReview.documentType,
+        confidence: pendingReview.confidence,
+      });
+      setSessionScanned((prev) => [createdTx, ...prev]);
+      setPendingReview(null);
+    } catch (err) {
+      setReviewError(
+        err instanceof Error ? err.message : 'Erro ao salvar lançamento confirmado.'
+      );
+    } finally {
+      setIsConfirming(false);
     }
   };
 
@@ -249,19 +359,23 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
     ctx.drawImage(video, 0, 0, width, height);
     const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
     stopCamera();
-    await processAndRegisterImage(dataUrl, 'image/jpeg');
+    await analyzeImageForReview(dataUrl, 'image/jpeg');
   };
 
   const handleFileSelected = async (file: File) => {
-    if (!file.type.startsWith('image/')) {
-      setScanError('Por favor, selecione um arquivo de imagem (JPG, PNG, WebP).');
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+      setScanError('Formato não suportado. Selecione uma imagem JPG, PNG ou WebP.');
+      return;
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      setScanError('O arquivo selecionado ultrapassa o limite seguro de tamanho (10 MB).');
       return;
     }
 
     try {
       stopCamera();
       const { dataUrl, mimeType } = await compressBlobToJpeg(file);
-      await processAndRegisterImage(dataUrl, mimeType);
+      await analyzeImageForReview(dataUrl, mimeType);
     } catch (err: unknown) {
       setScanError(
         err instanceof Error ? err.message : 'Erro ao preparar a imagem.'
@@ -273,11 +387,11 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
     try {
       stopCamera();
       setScanError(null);
-      const res = await fetch('/src/assets/images/receipt_supermarket_sample_1791335311360.jpg');
+      const res = await fetch(RECEIPT_SAMPLE_URL);
       if (!res.ok) throw new Error('Não foi possível carregar a imagem de exemplo.');
       const blob = await res.blob();
       const { dataUrl, mimeType } = await compressBlobToJpeg(blob);
-      await processAndRegisterImage(dataUrl, mimeType);
+      await analyzeImageForReview(dataUrl, mimeType);
     } catch (err: unknown) {
       setScanError(
         err instanceof Error ? err.message : 'Erro ao testar recibo de exemplo.'
@@ -285,10 +399,10 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
     }
   };
 
-  const handleUndoLast = () => {
+  const handleUndoLast = async () => {
     if (!lastRegistered) return;
     const targetId = lastRegistered.transaction.id;
-    onDeleteTransaction(targetId);
+    await onDeleteTransaction(targetId);
     setSessionScanned((prev) => prev.filter((t) => t.id !== targetId));
     setLastRegistered(null);
     setPreviewUrl(null);
@@ -297,9 +411,14 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
   const handleResetScanner = () => {
     setPreviewUrl(null);
     setScanError(null);
+    setReviewError(null);
+    setPendingReview(null);
     setLastRegistered(null);
     setCameraError(null);
   };
+
+  const isFieldUncertain = (field: UncertainReceiptField) =>
+    pendingReview?.uncertainFields.includes(field) ?? false;
 
   return (
     <div className="space-y-6 pb-10">
@@ -310,16 +429,15 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
             Escanear Recibo ou Conta
           </h1>
           <p className="text-xs sm:text-sm text-[#5C6661] mt-1">
-            Fotografe seu cupom fiscal, nota fiscal, conta de água ou conta de luz — a IA lê tudo e registra a despesa automaticamente.
+            Envie seu cupom fiscal, nota fiscal, conta de luz ou água. A IA extrai os dados para sua revisão e confirmação antes de salvar.
           </p>
         </div>
       </div>
 
-      {/* Main Grid: Capture Area (7 cols) + Supported Documents & Tips (5 cols) */}
+      {/* Main Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 sm:gap-6 items-start">
-        {/* Left: Capture & Scan Workspace */}
+        {/* Left: Capture & Review Workspace */}
         <div className="lg:col-span-7 bg-[#FFFFFF] rounded-2xl border border-[#EAE6DE] shadow-xs p-4 sm:p-6 space-y-5">
-          {/* Live Camera Viewfinder */}
           {isCameraOpen ? (
             <div className="space-y-4">
               <div className="relative rounded-2xl overflow-hidden bg-[#1A1C1A] aspect-[3/4] sm:aspect-[4/3] max-h-[60vh] flex items-center justify-center">
@@ -330,7 +448,6 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
                   muted
                   className="w-full h-full object-cover"
                 />
-                {/* Framing guide corners */}
                 <div className="pointer-events-none absolute inset-6 border-2 border-dashed border-white/50 rounded-xl flex items-end justify-center p-3">
                   <span className="text-[11px] font-medium text-white bg-black/55 px-3 py-1 rounded-full backdrop-blur-xs">
                     Enquadre o recibo ou conta com boa iluminação
@@ -340,8 +457,8 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
                 <button
                   type="button"
                   onClick={stopCamera}
+                  aria-label="Fechar câmera"
                   className="absolute top-3 right-3 p-2 rounded-full bg-black/60 text-white hover:bg-black/80 transition-colors cursor-pointer"
-                  title="Fechar câmera"
                 >
                   <X className="w-5 h-5" />
                 </button>
@@ -363,17 +480,16 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
                   className="px-6 py-3 rounded-full bg-[#274A3C] hover:bg-[#1E3B30] text-sm font-bold text-white flex items-center gap-2 shadow-sm transition-all active:scale-95 cursor-pointer"
                 >
                   <Camera className="w-4 h-4" />
-                  <span>Tirar Foto & Registrar</span>
+                  <span>Capturar para Revisão</span>
                 </button>
               </div>
             </div>
           ) : (
             <>
-              {/* Hidden file inputs */}
               <input
                 ref={cameraInputRef}
                 type="file"
-                accept="image/*"
+                accept="image/jpeg,image/png,image/webp"
                 capture="environment"
                 className="hidden"
                 onChange={(e) => {
@@ -385,7 +501,7 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
               <input
                 ref={galleryInputRef}
                 type="file"
-                accept="image/*"
+                accept="image/jpeg,image/png,image/webp"
                 className="hidden"
                 onChange={(e) => {
                   const file = e.target.files?.[0];
@@ -394,27 +510,26 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
                 }}
               />
 
-              {/* If scanning or showing result */}
               {previewUrl ? (
                 <div className="space-y-4">
-                  <div className="relative rounded-2xl overflow-hidden bg-[#F4F3F0] border border-[#EAE6DE] max-h-80 flex items-center justify-center">
+                  <div className="relative rounded-2xl overflow-hidden bg-[#F4F3F0] border border-[#EAE6DE] max-h-72 flex items-center justify-center">
                     <img
                       src={previewUrl}
                       alt="Foto do documento capturado"
-                      className={`max-h-80 w-full object-contain transition-opacity duration-300 ${
+                      className={`max-h-72 w-full object-contain transition-opacity duration-300 ${
                         isScanning ? 'opacity-50' : 'opacity-100'
                       }`}
                     />
                     {isScanning && (
-                      <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#FAF9F6]/75 backdrop-blur-[2px] p-4 text-center">
+                      <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#FAF9F6]/80 backdrop-blur-[2px] p-4 text-center">
                         <div className="w-12 h-12 rounded-2xl bg-[#274A3C] text-[#C4EBD8] flex items-center justify-center mb-3 animate-pulse">
                           <Sparkles className="w-6 h-6" />
                         </div>
                         <p className="text-sm sm:text-base font-bold text-[#1A1C1A]">
-                          Lendo documento com IA...
+                          Analisando documento com Gemini...
                         </p>
                         <p className="text-xs text-[#5C6661] mt-1 max-w-xs">
-                          Identificando valor total, estabelecimento, data e categoria da despesa.
+                          Extraindo estabelecimento, valor, data e categoria para você revisar.
                         </p>
                       </div>
                     )}
@@ -422,11 +537,11 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
 
                   {/* Error State */}
                   {scanError && !isScanning && (
-                    <div className="p-4 rounded-2xl bg-[#FDF0ED] border border-[#F5C2B8] space-y-3">
+                    <div role="alert" className="p-4 rounded-2xl bg-[#FDF0ED] border border-[#F5C2B8] space-y-3">
                       <div className="flex items-start gap-2.5 text-[#BA1A1A]">
                         <AlertCircle className="w-5 h-5 shrink-0 mt-0.5" />
                         <div className="text-xs sm:text-sm">
-                          <p className="font-bold">Não foi possível registrar automaticamente</p>
+                          <p className="font-bold">Não foi possível interpretar este documento</p>
                           <p className="mt-0.5 text-[#7A2018]">{scanError}</p>
                         </div>
                       </div>
@@ -436,21 +551,240 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
                           onClick={handleResetScanner}
                           className="px-4 py-2 rounded-full bg-[#FFFFFF] border border-[#D9D5CC] text-xs font-semibold text-[#1A1C1A] hover:bg-[#FAF9F6] cursor-pointer"
                         >
-                          Tentar outra foto
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => cameraInputRef.current?.click()}
-                          className="px-4 py-2 rounded-full bg-[#274A3C] text-xs font-semibold text-white hover:bg-[#1E3B30] cursor-pointer"
-                        >
-                          Tirar nova foto
+                          Tentar outra imagem
                         </button>
                       </div>
                     </div>
                   )}
 
-                  {/* Success Auto-Registered Card */}
-                  {lastRegistered && !isScanning && (
+                  {/* Editable Human-Review Form (Mandatory before saving!) */}
+                  {pendingReview && !isScanning && (
+                    <form
+                      onSubmit={handleConfirmReview}
+                      className="p-4 sm:p-5 rounded-2xl bg-[#FAF9F6] border border-[#D8E2DC] space-y-4"
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <span className="inline-flex items-center gap-1 text-[11px] font-bold uppercase tracking-wider text-[#274A3C] bg-[#E3ECE7] px-2.5 py-0.5 rounded-full">
+                            Prévia para Confirmação
+                          </span>
+                          <h3 className="text-sm sm:text-base font-bold text-[#1A1C1A] mt-1.5">
+                            Revise os dados lidos antes de registrar
+                          </h3>
+                          <p className="text-[11px] text-[#5C6661]">
+                            {pendingReview.documentType} · Confiança {pendingReview.confidence} · A leitura por IA não confirma pagamento automaticamente.
+                          </p>
+                        </div>
+                      </div>
+
+                      {pendingReview.uncertainFields.length > 0 && (
+                        <div className="p-3 rounded-xl bg-[#FCF1ED] border border-[#F5D3C4] text-xs text-[#954827] flex items-start gap-2">
+                          <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5" />
+                          <span>
+                            Campos marcados como <strong>Pendente de revisão</strong> não estavam nítidos no documento. Confira antes de confirmar.
+                          </span>
+                        </div>
+                      )}
+
+                      {reviewError && (
+                        <div role="alert" className="p-3 rounded-xl bg-[#FDF0ED] border border-[#F5C2B8] text-xs font-semibold text-[#BA1A1A] flex items-center gap-2">
+                          <AlertCircle className="w-4 h-4 shrink-0" />
+                          <span>{reviewError}</span>
+                        </div>
+                      )}
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                        <div className="sm:col-span-2">
+                          <label htmlFor="scan-desc" className="flex items-center justify-between font-bold text-[#1A1C1A] mb-1">
+                            <span>Descrição / Estabelecimento</span>
+                            {isFieldUncertain('description') && (
+                              <span className="text-[10px] font-semibold text-[#954827] bg-[#FCF1ED] px-1.5 py-0.5 rounded">
+                                Pendente de revisão
+                              </span>
+                            )}
+                          </label>
+                          <input
+                            id="scan-desc"
+                            type="text"
+                            value={pendingReview.description}
+                            onChange={(e) =>
+                              setPendingReview({ ...pendingReview, description: e.target.value })
+                            }
+                            className="w-full px-3 py-2 bg-[#FFFFFF] border border-[#D9D5CC] rounded-xl text-sm focus:outline-none focus:border-[#3F6253]"
+                          />
+                        </div>
+
+                        <div>
+                          <label htmlFor="scan-amount" className="flex items-center justify-between font-bold text-[#1A1C1A] mb-1">
+                            <span>Valor Total (R$)</span>
+                            {isFieldUncertain('amount') && (
+                              <span className="text-[10px] font-semibold text-[#954827] bg-[#FCF1ED] px-1.5 py-0.5 rounded">
+                                Pendente de revisão
+                              </span>
+                            )}
+                          </label>
+                          <input
+                            id="scan-amount"
+                            type="text"
+                            inputMode="decimal"
+                            value={pendingReview.amountStr}
+                            onChange={(e) =>
+                              setPendingReview({ ...pendingReview, amountStr: e.target.value })
+                            }
+                            className="w-full px-3 py-2 bg-[#FFFFFF] border border-[#D9D5CC] rounded-xl text-sm font-mono font-bold focus:outline-none focus:border-[#3F6253]"
+                          />
+                        </div>
+
+                        <div>
+                          <label htmlFor="scan-date" className="flex items-center justify-between font-bold text-[#1A1C1A] mb-1">
+                            <span>Data / Vencimento</span>
+                            {isFieldUncertain('date') && (
+                              <span className="text-[10px] font-semibold text-[#954827] bg-[#FCF1ED] px-1.5 py-0.5 rounded">
+                                Pendente de revisão
+                              </span>
+                            )}
+                          </label>
+                          <input
+                            id="scan-date"
+                            type="date"
+                            value={pendingReview.date}
+                            onChange={(e) =>
+                              setPendingReview({ ...pendingReview, date: e.target.value })
+                            }
+                            className="w-full px-3 py-2 bg-[#FFFFFF] border border-[#D9D5CC] rounded-xl text-sm focus:outline-none focus:border-[#3F6253]"
+                          />
+                        </div>
+
+                        <div>
+                          <label htmlFor="scan-category" className="flex items-center justify-between font-bold text-[#1A1C1A] mb-1">
+                            <span>Categoria</span>
+                            {isFieldUncertain('category') && (
+                              <span className="text-[10px] font-semibold text-[#954827] bg-[#FCF1ED] px-1.5 py-0.5 rounded">
+                                Pendente de revisão
+                              </span>
+                            )}
+                          </label>
+                          <select
+                            id="scan-category"
+                            value={pendingReview.category}
+                            onChange={(e) =>
+                              setPendingReview({ ...pendingReview, category: e.target.value })
+                            }
+                            className="w-full px-3 py-2 bg-[#FFFFFF] border border-[#D9D5CC] rounded-xl text-sm focus:outline-none focus:border-[#3F6253]"
+                          >
+                            {DEFAULT_CATEGORIES.map((c) => (
+                              <option key={c.name} value={c.name}>
+                                {c.name}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <div>
+                          <label htmlFor="scan-account" className="flex items-center justify-between font-bold text-[#1A1C1A] mb-1">
+                            <span>Forma de Pagamento</span>
+                            {isFieldUncertain('account') && (
+                              <span className="text-[10px] font-semibold text-[#954827] bg-[#FCF1ED] px-1.5 py-0.5 rounded">
+                                Pendente de revisão
+                              </span>
+                            )}
+                          </label>
+                          <select
+                            id="scan-account"
+                            value={pendingReview.account}
+                            onChange={(e) =>
+                              setPendingReview({
+                                ...pendingReview,
+                                account: e.target.value as PaymentMethod,
+                              })
+                            }
+                            className="w-full px-3 py-2 bg-[#FFFFFF] border border-[#D9D5CC] rounded-xl text-sm focus:outline-none focus:border-[#3F6253]"
+                          >
+                            {PAYMENT_METHODS.map((pm) => (
+                              <option key={pm} value={pm}>
+                                {pm}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <div className="sm:col-span-2">
+                          <div className="flex items-center justify-between font-bold text-[#1A1C1A] mb-1">
+                            <span>Situação do Pagamento</span>
+                            {isFieldUncertain('status') && (
+                              <span className="text-[10px] font-semibold text-[#954827] bg-[#FCF1ED] px-1.5 py-0.5 rounded">
+                                Pendente de revisão
+                              </span>
+                            )}
+                          </div>
+                          <div className="grid grid-cols-2 gap-2">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setPendingReview({ ...pendingReview, status: 'paid' })
+                              }
+                              className={`py-2 px-3 rounded-xl border text-xs font-semibold cursor-pointer ${
+                                pendingReview.status === 'paid'
+                                  ? 'bg-[#EEF3F0] text-[#274A3C] border-[#3F6253]'
+                                  : 'bg-[#FFFFFF] text-[#5C6661] border-[#E6E2D8]'
+                              }`}
+                            >
+                              ✓ Já foi pago (Efetivado)
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setPendingReview({ ...pendingReview, status: 'pending' })
+                              }
+                              className={`py-2 px-3 rounded-xl border text-xs font-semibold cursor-pointer ${
+                                pendingReview.status === 'pending'
+                                  ? 'bg-[#FCF1ED] text-[#C96846] border-[#E0835D]'
+                                  : 'bg-[#FFFFFF] text-[#5C6661] border-[#E6E2D8]'
+                              }`}
+                            >
+                              ⏳ A pagar (Pendente)
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="sm:col-span-2">
+                          <label htmlFor="scan-notes" className="block font-bold text-[#1A1C1A] mb-1">
+                            Detalhes extraídos / Observações
+                          </label>
+                          <textarea
+                            id="scan-notes"
+                            rows={2}
+                            value={pendingReview.notes}
+                            onChange={(e) =>
+                              setPendingReview({ ...pendingReview, notes: e.target.value })
+                            }
+                            className="w-full px-3 py-2 bg-[#FFFFFF] border border-[#D9D5CC] rounded-xl text-xs focus:outline-none focus:border-[#3F6253] resize-none"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="pt-2 flex flex-wrap items-center justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={handleResetScanner}
+                          disabled={isConfirming}
+                          className="px-4 py-2 rounded-full bg-[#FFFFFF] border border-[#D9D5CC] text-xs font-semibold text-[#5C6661] hover:text-[#1A1C1A] cursor-pointer"
+                        >
+                          Descartar
+                        </button>
+                        <button
+                          type="submit"
+                          disabled={isConfirming}
+                          className="px-5 py-2.5 rounded-full bg-[#274A3C] hover:bg-[#1E3B30] text-xs font-bold text-white shadow-sm cursor-pointer disabled:opacity-60"
+                        >
+                          {isConfirming ? 'Salvando...' : 'Confirmar e Salvar Despesa'}
+                        </button>
+                      </div>
+                    </form>
+                  )}
+
+                  {/* Confirmed & Saved Card */}
+                  {lastRegistered && !isScanning && !pendingReview && (
                     <div className="p-4 sm:p-5 rounded-2xl bg-[#EDF5F0] border border-[#B9DCC7] space-y-4">
                       <div className="flex items-start justify-between gap-3">
                         <div className="flex items-center gap-2.5">
@@ -459,10 +793,10 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
                           </div>
                           <div>
                             <h3 className="text-sm sm:text-base font-bold text-[#1A1C1A]">
-                              Despesa registrada automaticamente
+                              Despesa confirmada e salva
                             </h3>
                             <p className="text-xs text-[#2B4D3F]">
-                              {lastRegistered.documentType} · Confiança {lastRegistered.confidence}
+                              {lastRegistered.documentType} · Comprovante arquivado com segurança
                             </p>
                           </div>
                         </div>
@@ -498,14 +832,6 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
                             {lastRegistered.transaction.status === 'paid' ? 'Efetivado' : 'Pendente'}
                           </span>
                         </div>
-                        {lastRegistered.transaction.notes && (
-                          <div className="sm:col-span-2 pt-1 border-t border-[#F2EFE9]">
-                            <span className="text-[#5C6661] block">Detalhes lidos pela IA</span>
-                            <span className="text-[#414844]">
-                              {lastRegistered.transaction.notes}
-                            </span>
-                          </div>
-                        )}
                       </div>
 
                       <div className="flex flex-wrap items-center gap-2 pt-1">
@@ -549,7 +875,6 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
                   )}
                 </div>
               ) : (
-                /* Empty Dropzone & Camera Buttons */
                 <div
                   onDragOver={(e) => {
                     e.preventDefault();
@@ -575,7 +900,7 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
                     Fotografe ou envie seu documento
                   </h2>
                   <p className="text-xs sm:text-sm text-[#5C6661] mt-1 max-w-md mx-auto">
-                    Funciona com cupom fiscal, nota fiscal, boleto, conta de luz, conta de água ou comprovante Pix. Assim que a foto for enviada, o débito é lançado na hora.
+                    Aceita imagens JPG, PNG e WebP (até 8 MB). Após a análise da IA, você revisa os campos e confirma antes de gravar.
                   </p>
 
                   {cameraError && (
@@ -639,7 +964,7 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
         <div className="lg:col-span-5 space-y-4">
           <div className="bg-[#FFFFFF] rounded-2xl border border-[#EAE6DE] shadow-xs p-5 space-y-4">
             <h2 className="text-base font-bold text-[#1A1C1A]">
-              O que a IA identifica automaticamente
+              Como funciona a leitura segura
             </h2>
 
             <div className="space-y-3 text-xs sm:text-sm">
@@ -650,7 +975,7 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
                 <div>
                   <p className="font-semibold text-[#1A1C1A]">Recibos e Cupons Fiscais</p>
                   <p className="text-xs text-[#5C6661]">
-                    Mercados, farmácias, restaurantes, padarias e compras no cartão ou Pix.
+                    Extrai estabelecimento, total e forma de pagamento para prévia editável.
                   </p>
                 </div>
               </div>
@@ -662,7 +987,7 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
                 <div>
                   <p className="font-semibold text-[#1A1C1A]">Contas de Luz (Energia)</p>
                   <p className="text-xs text-[#5C6661]">
-                    Lê o valor total, data de vencimento, concessionária e consumo em kWh.
+                    Identifica vencimento e concessionária; boletos em aberto ficam como Pendente.
                   </p>
                 </div>
               </div>
@@ -674,7 +999,7 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
                 <div>
                   <p className="font-semibold text-[#1A1C1A]">Contas de Água e Serviços</p>
                   <p className="text-xs text-[#5C6661]">
-                    Faturas de água, gás, internet e boletos com classificação automática em Serviços & Contas.
+                    Faturas de água, gás, internet e boletos com proteção contra duplicidade.
                   </p>
                 </div>
               </div>
@@ -684,9 +1009,9 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
                   <FileText className="w-4 h-4" />
                 </div>
                 <div>
-                  <p className="font-semibold text-[#1A1C1A]">Notas Fiscais</p>
+                  <p className="font-semibold text-[#1A1C1A]">Armazenamento Privado</p>
                   <p className="text-xs text-[#5C6661]">
-                    Extrai emissor, valor líquido e salva a foto do comprovante no seu extrato.
+                    Após sua confirmação, a imagem é salva no seu bucket privado no Supabase Storage.
                   </p>
                 </div>
               </div>
@@ -694,10 +1019,10 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
           </div>
 
           <div className="bg-[#F4F3F0] rounded-2xl border border-[#E9E5DC] p-4 sm:p-5 text-xs text-[#5C6661] space-y-1.5">
-            <p className="font-bold text-[#1A1C1A]">Dicas para uma leitura precisa</p>
-            <p>1. Apoie o papel em uma superfície plana com boa iluminação.</p>
-            <p>2. Enquadre o nome do estabelecimento e o valor total.</p>
-            <p>3. Se quiser ajustar algum detalhe após o registro, clique em "Editar detalhes".</p>
+            <p className="font-bold text-[#1A1C1A]">Fluxo de validação humana</p>
+            <p>1. Envie ou fotografe o comprovante em local bem iluminado.</p>
+            <p>2. Confira os campos extraídos (especialmente os marcados como pendentes de revisão).</p>
+            <p>3. Clique em "Confirmar e Salvar Despesa" para gravar no extrato.</p>
           </div>
         </div>
       </div>
@@ -708,10 +1033,10 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
           <div className="flex items-center justify-between mb-4">
             <div>
               <h2 className="text-base sm:text-lg font-bold text-[#1A1C1A]">
-                Registrados por foto agora ({sessionScanned.length})
+                Confirmados nesta sessão ({sessionScanned.length})
               </h2>
               <p className="text-xs text-[#5C6661]">
-                Estes lançamentos já estão salvos no seu extrato e orçamentos.
+                Lançamentos salvos com comprovante vinculado.
               </p>
             </div>
             <button
@@ -725,60 +1050,60 @@ export const ScanReceiptView: React.FC<ScanReceiptViewProps> = ({
           </div>
 
           <div className="divide-y divide-[#F2EFE9]">
-            {sessionScanned.map((tx) => (
-              <div
-                key={tx.id}
-                className="py-3 flex items-center justify-between gap-3"
-              >
-                <div className="flex items-center gap-3 min-w-0">
-                  {tx.imageUrl ? (
-                    <button
-                      type="button"
-                      onClick={() => onViewReceipt(tx)}
-                      className="w-10 h-10 rounded-xl overflow-hidden border border-[#E6E2D8] shrink-0 cursor-pointer"
-                      title="Ampliar foto do recibo"
-                    >
-                      <img
-                        src={tx.imageUrl}
-                        alt={tx.description}
-                        className="w-full h-full object-cover"
-                      />
-                    </button>
-                  ) : (
-                    <div className="w-10 h-10 rounded-xl bg-[#FCF1ED] text-[#C96846] flex items-center justify-center shrink-0">
-                      <CategoryIcon name={tx.category} className="w-5 h-5" />
-                    </div>
-                  )}
+            {sessionScanned.map((tx) => {
+              const resolvedImg = resolveAssetUrl(tx.imageUrl);
+              return (
+                <div key={tx.id} className="py-3 flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-3 min-w-0">
+                    {resolvedImg ? (
+                      <button
+                        type="button"
+                        onClick={() => onViewReceipt({ ...tx, imageUrl: resolvedImg })}
+                        className="w-10 h-10 rounded-xl overflow-hidden border border-[#E6E2D8] shrink-0 cursor-pointer"
+                        title="Ampliar foto do recibo"
+                      >
+                        <img
+                          src={resolvedImg}
+                          alt={tx.description}
+                          className="w-full h-full object-cover"
+                        />
+                      </button>
+                    ) : (
+                      <div className="w-10 h-10 rounded-xl bg-[#FCF1ED] text-[#C96846] flex items-center justify-center shrink-0">
+                        <CategoryIcon name={tx.category} className="w-5 h-5" />
+                      </div>
+                    )}
 
-                  <div className="min-w-0">
-                    <p className="text-xs sm:text-sm font-bold text-[#1A1C1A] truncate">
-                      {tx.description}
-                    </p>
-                    <div className="flex items-center gap-1.5 text-[11px] text-[#5C6661] mt-0.5 flex-wrap">
-                      <span>{formatFriendlyDate(tx.date)}</span>
-                      <span aria-hidden="true">·</span>
-                      <span>{tx.category}</span>
-                      <span aria-hidden="true">·</span>
-                      <span>{tx.account}</span>
+                    <div className="min-w-0">
+                      <p className="text-xs sm:text-sm font-bold text-[#1A1C1A] truncate">
+                        {tx.description}
+                      </p>
+                      <div className="flex items-center gap-1.5 text-[11px] text-[#5C6661] mt-0.5 flex-wrap">
+                        <span>{formatFriendlyDate(tx.date)}</span>
+                        <span aria-hidden="true">·</span>
+                        <span>{tx.category}</span>
+                        <span aria-hidden="true">·</span>
+                        <span>{tx.account}</span>
+                      </div>
                     </div>
                   </div>
-                </div>
 
-                <div className="flex items-center gap-2 shrink-0">
-                  <span className="text-sm font-bold text-[#1A1C1A] font-mono tabular-nums">
-                    -{formatCurrency(tx.amount)}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => onEditTransaction(tx)}
-                    className="p-1.5 text-[#5C6661] hover:text-[#1A1C1A] hover:bg-[#F2EFE9] rounded-lg cursor-pointer"
-                    title="Editar lançamento"
-                  >
-                    <Edit2 className="w-3.5 h-3.5" />
-                  </button>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className="text-sm font-bold text-[#1A1C1A] font-mono tabular-nums">
+                      -{formatCurrency(tx.amount)}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => onEditTransaction(tx)}
+                      aria-label={`Editar ${tx.description}`}
+                      className="p-1.5 text-[#5C6661] hover:text-[#1A1C1A] hover:bg-[#F2EFE9] rounded-lg cursor-pointer"
+                    >
+                      <Edit2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}

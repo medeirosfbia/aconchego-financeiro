@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useId } from 'react';
 import { AlertTriangle, Trash2, RotateCcw, X } from 'lucide-react';
 
 interface ConfirmationModalProps {
@@ -9,8 +9,9 @@ interface ConfirmationModalProps {
   cancelLabel?: string;
   isDestructive?: boolean;
   iconType?: 'trash' | 'reset' | 'warning';
-  onConfirm: () => void;
+  onConfirm: () => void | Promise<void>;
   onCancel: () => void;
+  isSubmitting?: boolean;
 }
 
 export const ConfirmationModal: React.FC<ConfirmationModalProps> = ({
@@ -23,13 +24,30 @@ export const ConfirmationModal: React.FC<ConfirmationModalProps> = ({
   iconType = 'trash',
   onConfirm,
   onCancel,
+  isSubmitting = false,
 }) => {
+  const titleId = useId();
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !isSubmitting) {
+        onCancel();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isOpen, isSubmitting, onCancel]);
+
   if (!isOpen) return null;
 
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/50 backdrop-blur-xs animate-in fade-in duration-150"
-      onClick={onCancel}
+      onClick={() => !isSubmitting && onCancel()}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby={titleId}
     >
       <div
         className="bg-[#FFFFFF] w-full max-w-sm rounded-3xl border border-[#EAE6DE] shadow-xl overflow-hidden animate-in zoom-in-95 duration-150 p-5 sm:p-6"
@@ -55,15 +73,18 @@ export const ConfirmationModal: React.FC<ConfirmationModalProps> = ({
           </div>
 
           <button
+            type="button"
             onClick={onCancel}
-            className="p-1.5 text-[#5C6661] hover:text-[#1A1C1A] hover:bg-[#F2EFE9] rounded-full transition-colors cursor-pointer"
+            disabled={isSubmitting}
+            aria-label="Fechar caixa de confirmação"
+            className="p-1.5 text-[#5C6661] hover:text-[#1A1C1A] hover:bg-[#F2EFE9] rounded-full transition-colors cursor-pointer disabled:opacity-50"
           >
             <X className="w-4 h-4" />
           </button>
         </div>
 
         <div className="mt-3.5">
-          <h3 className="text-base sm:text-lg font-bold text-[#1A1C1A]">
+          <h3 id={titleId} className="text-base sm:text-lg font-bold text-[#1A1C1A]">
             {title}
           </h3>
           <p className="text-xs sm:text-sm text-[#5C6661] mt-1 leading-relaxed">
@@ -75,23 +96,25 @@ export const ConfirmationModal: React.FC<ConfirmationModalProps> = ({
           <button
             type="button"
             onClick={onCancel}
-            className="flex-1 py-2.5 px-3 rounded-xl border border-[#D9D5CC] bg-[#FFFFFF] hover:bg-[#F2EFE9] text-xs font-semibold text-[#5C6661] transition-colors cursor-pointer text-center"
+            disabled={isSubmitting}
+            className="flex-1 py-2.5 px-3 rounded-xl border border-[#D9D5CC] bg-[#FFFFFF] hover:bg-[#F2EFE9] text-xs font-semibold text-[#5C6661] transition-colors cursor-pointer text-center disabled:opacity-50"
           >
             {cancelLabel}
           </button>
           <button
             type="button"
-            onClick={() => {
-              onConfirm();
+            disabled={isSubmitting}
+            onClick={async () => {
+              await onConfirm();
               onCancel();
             }}
-            className={`flex-1 py-2.5 px-3 rounded-xl text-xs font-bold text-white transition-all shadow-xs cursor-pointer text-center active:scale-95 ${
+            className={`flex-1 py-2.5 px-3 rounded-xl text-xs font-bold text-white transition-all shadow-xs cursor-pointer text-center active:scale-95 disabled:opacity-60 ${
               isDestructive
                 ? 'bg-[#BA1A1A] hover:bg-[#961515]'
                 : 'bg-[#274A3C] hover:bg-[#1E3B30]'
             }`}
           >
-            {confirmLabel}
+            {isSubmitting ? 'Processando...' : confirmLabel}
           </button>
         </div>
       </div>
